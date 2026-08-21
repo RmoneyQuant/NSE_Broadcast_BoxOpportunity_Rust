@@ -1,0 +1,1 @@
+$env:NSE_FO_LOCAL_IF="192.168.50.210"; cargo run -p box_scanner_live -- live

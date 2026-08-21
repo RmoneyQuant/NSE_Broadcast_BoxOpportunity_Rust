@@ -1,0 +1,16 @@
+stages:
+  - build
+
+build:
+  stage: build
+  image: rust:1.97
+  script:
+    - cargo build --workspace --verbose
+    # cargo test --workspace already runs every tests/latency_budget.rs
+    # gate (Phase 9) alongside the functional suite -- no separate perf
+    # stage needed for that. cargo fmt --check is deliberately not run
+    # here: the codebase predates any cargo fmt pass, so enabling it now
+    # would fail on pre-existing formatting unrelated to any given change,
+    # not regressions this pipeline introduced.
+    - cargo test --workspace --verbose
+    - cargo clippy --workspace --all-targets --verbose -- -D warnings

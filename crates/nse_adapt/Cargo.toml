@@ -1,0 +1,8 @@
+[package]
+name = "nse_adapt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nse_decode = { version = "0.1.0", path = "../nse_decode" }
+serde = { version = "1.0.228", features = ["derive"] }

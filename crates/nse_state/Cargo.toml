@@ -1,0 +1,20 @@
+[package]
+name = "nse_state"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arc-swap = "1.7.1"
+chrono = "0.4.45"
+nse_adapt = { version = "0.1.0", path = "../nse_adapt" }
+nse_pricing = { version = "0.1.0", path = "../nse_pricing" }
+nse_refdata = { version = "0.1.0", path = "../nse_refdata" }
+
+[dev-dependencies]
+criterion = "0.7.0"
+nse_decode = { version = "0.1.0", path = "../nse_decode" }
+socket2 = "0.6.5"
+
+[[bench]]
+name = "scheduler"
+harness = false

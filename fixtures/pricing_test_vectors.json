@@ -1,0 +1,42 @@
+[
+  {
+    "name": "itm_call_side_box_below_strike_diff",
+    "k1": 23900.0,
+    "k2": 24000.0,
+    "days_to_expiry": 30,
+    "call_k1": { "bid": 120.0, "ask": 125.0 },
+    "put_k1": { "bid": 30.0, "ask": 32.0 },
+    "call_k2": { "bid": 40.0, "ask": 42.0 },
+    "put_k2": { "bid": 60.0, "ask": 62.0 }
+  },
+  {
+    "name": "atm_tight_spread_near_expiry",
+    "k1": 25000.0,
+    "k2": 25100.0,
+    "days_to_expiry": 3,
+    "call_k1": { "bid": 88.5, "ask": 89.0 },
+    "put_k1": { "bid": 11.2, "ask": 11.6 },
+    "call_k2": { "bid": 41.0, "ask": 41.5 },
+    "put_k2": { "bid": 51.0, "ask": 51.6 }
+  },
+  {
+    "name": "wide_strikes_far_expiry",
+    "k1": 22000.0,
+    "k2": 24000.0,
+    "days_to_expiry": 120,
+    "call_k1": { "bid": 2150.0, "ask": 2165.0 },
+    "put_k1": { "bid": 95.0, "ask": 98.0 },
+    "call_k2": { "bid": 340.0, "ask": 345.0 },
+    "put_k2": { "bid": 1980.0, "ask": 1995.0 }
+  },
+  {
+    "name": "zero_bid_leg_should_skip",
+    "k1": 24000.0,
+    "k2": 24100.0,
+    "days_to_expiry": 15,
+    "call_k1": { "bid": 0.0, "ask": 55.0 },
+    "put_k1": { "bid": 20.0, "ask": 21.0 },
+    "call_k2": { "bid": 25.0, "ask": 26.0 },
+    "put_k2": { "bid": 45.0, "ask": 46.0 }
+  }
+]

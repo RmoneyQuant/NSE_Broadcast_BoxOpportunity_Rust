@@ -1,0 +1,20 @@
+[package]
+name = "box_scanner_live"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nse_adapt = { version = "0.1.0", path = "../../crates/nse_adapt" }
+nse_decode = { version = "0.1.0", path = "../../crates/nse_decode" }
+nse_pricing = { version = "0.1.0", path = "../../crates/nse_pricing" }
+nse_refdata = { version = "0.1.0", path = "../../crates/nse_refdata" }
+nse_sink = { version = "0.1.0", path = "../../crates/nse_sink" }
+nse_state = { version = "0.1.0", path = "../../crates/nse_state" }
+socket2 = "0.6.5"
+chrono = "0.4.45"
+# Win32 common controls (ListView, etc.) via GDI -- no GPU dependency at
+# all, unlike egui (tried first; abandoned after confirming via
+# RUST_LOG=info that neither wgpu nor glow could find any adapter at all
+# in this deployment's session, most likely an RDP/VDI session without GPU
+# passthrough). GDI is exactly what RDP was built to virtualize.
+native-windows-gui = { version = "1.0.13", default-features = false, features = ["list-view", "animation-timer", "combobox", "listbox"] }
