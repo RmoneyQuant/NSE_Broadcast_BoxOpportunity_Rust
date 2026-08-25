@@ -1,5 +1,7 @@
 mod feed;
 mod gui;
+mod order_log;
+mod rmtrade_gateway;
 mod source;
 
 use gui::{FilterSpec, GuiState, SharedFilterRequest, SharedGuiState};
@@ -37,6 +39,7 @@ const DEFAULT_CONTRACT_CSV_REPLAY: &str = "fixtures/fo_contract_stream_info.csv"
 const DEFAULT_CONTRACT_CSV_LIVE: &str = r"C:\Users\rishav.raj\Desktop\workspace\box_scanner_rust\fixtures\fo_contract_stream_info.csv";
 const DEFAULT_OPPORTUNITY_LOG: &str = "opportunities.jsonl";
 const DEFAULT_ALERT_LOG: &str = "alerts.jsonl";
+const DEFAULT_RMTRADE_ORDER_LOG: &str = "rmtrade_orders.csv";
 /// No real risk-free/MIBOR feed exists in this pipeline -- 0.0 until the
 /// operator sets a real reference rate. See `NSE_FO_BENCHMARK_RATE` below.
 const DEFAULT_BENCHMARK_RATE: f64 = 0.0;
@@ -187,6 +190,19 @@ fn main() {
 
     let (expiries, strikes_by_expiry) = expiry_and_strike_catalog(&instruments);
     println!("{} expiry/expiries available", expiries.len());
+
+    // Built once from the full contract file, before any expiry/strike
+    // filter narrows `instruments` -- feeds the GUI's "Send to RMTrade"
+    // button, which needs to resolve any priced pair's four leg tokens
+    // regardless of which filter happens to be active when it's clicked.
+    let token_index = rmtrade_gateway::build_token_index(&instruments);
+
+    // One CSV row per RMTrade send attempt, success or failure -- opened
+    // once here (append mode, like the opportunity/alert logs below) and
+    // handed to the GUI, which is the only thing that ever writes to it.
+    let rmtrade_order_log = env::var("RMTRADE_ORDER_LOG").unwrap_or_else(|_| DEFAULT_RMTRADE_ORDER_LOG.to_string());
+    let order_log = order_log::OrderLog::open(&rmtrade_order_log).unwrap_or_else(|e| panic!("failed to open RMTrade order log {rmtrade_order_log}: {e}"));
+    println!("Logging RMTrade send attempts to {rmtrade_order_log}");
 
     let future_token = nearest_future_token(&instruments, "NIFTY");
     match future_token {
@@ -343,7 +359,7 @@ fn main() {
         );
     });
 
-    if let Err(e) = gui::run(gui_state, filter_request, expiries, strikes_by_expiry) {
+    if let Err(e) = gui::run(gui_state, filter_request, expiries, strikes_by_expiry, token_index, order_log) {
         eprintln!(
             "desktop window failed to open: {e}\n\
              This usually means no interactive Windows desktop session is available to this \

@@ -11,6 +11,8 @@
 //! the main thread, as `nwg::dispatch_thread_events` requires) never
 //! touches the decoder/pricing session directly.
 
+use crate::order_log::OrderLog;
+use crate::rmtrade_gateway::{self, BoxSpreadParams, TokenIndex};
 use native_windows_gui as nwg;
 use nse_pricing::{DropEvent, OpportunityRecord};
 use nse_sink::{Side, WireOpportunityRecord, WirePairId};
@@ -103,7 +105,8 @@ impl GuiState {
 // short tables, since they trade opposite legs at each strike. "Rate" is
 // the un-annualized return over the trade's life; "Ann. rate" scales that
 // by 365/DTE.
-const COLUMNS: [(&str, i32); 17] = [
+const COLUMNS: [(&str, i32); 18] = [
+    ("RMTrade", 90),
     ("Expiry", 95),
     ("DTE", 45),
     ("K1", 60),
@@ -123,6 +126,16 @@ const COLUMNS: [(&str, i32); 17] = [
     ("Src", 55),
 ];
 
+/// Index of the clickable "RMTrade" action cell -- kept first (not last)
+/// so it's always visible without horizontal scrolling, unlike an earlier
+/// version of this that put it last and got scrolled out of view.
+/// `OnListViewClick`'s hit-tested `column_index` is compared against this
+/// to tell a click meant to submit that row from a click anywhere else in
+/// it (selecting the row, clicking a price cell, ...) -- selecting a row no
+/// longer sends by itself, since that turned out to fire on an ordinary
+/// "just looking" click.
+const RMTRADE_COLUMN_INDEX: usize = 0;
+
 /// Sorted by highest Net (`spread_tax`) first -- the real, tax-adjusted
 /// cash deployed (long table) / generated (short table) for that row, per
 /// explicit request. No separate sort-by UI control is offered here the
@@ -140,8 +153,9 @@ fn sorted_rows(rows: &HashMap<WirePairId, WireOpportunityRecord>, min_rate: Opti
     sorted
 }
 
-fn row_strings(r: &WireOpportunityRecord, lot_multiplier: f64) -> [String; 17] {
+fn row_strings(r: &WireOpportunityRecord, lot_multiplier: f64) -> [String; 18] {
     [
+        "\u{1F4E4} Send".to_string(),
         r.expiry.map(|d| d.format("%d-%b-%Y").to_string()).unwrap_or_default(),
         r.days_to_expiry.to_string(),
         r.pair_id.k1.to_string(),
@@ -192,12 +206,129 @@ fn populate_strikes_for_expiry(strikes_listbox: &nwg::ListBox<String>, current_s
     *current_strikes.borrow_mut() = strikes;
 }
 
-fn refresh_list(list: &nwg::ListView, rows: &HashMap<WirePairId, WireOpportunityRecord>, lot_multiplier: f64, min_rate: Option<f64>, max_rate: Option<f64>) {
+/// `row_ids`, index-aligned with `list`'s rows, is refreshed alongside it --
+/// the ListView itself only stores display strings, so this is what the
+/// per-row "RMTrade" cell click uses to map a clicked row index back to the
+/// `WireOpportunityRecord` it came from.
+fn refresh_list(list: &nwg::ListView, row_ids: &RefCell<Vec<WirePairId>>, rows: &HashMap<WirePairId, WireOpportunityRecord>, lot_multiplier: f64, min_rate: Option<f64>, max_rate: Option<f64>) {
     list.clear();
+    let mut ids = Vec::new();
     for r in sorted_rows(rows, min_rate, max_rate) {
         let cells = row_strings(r, lot_multiplier);
         let refs: Vec<&str> = cells.iter().map(String::as_str).collect();
         list.insert_items_row(None, &refs);
+        ids.push(r.pair_id);
+    }
+    *row_ids.borrow_mut() = ids;
+}
+
+/// Looks up the row `WireOpportunityRecord` clicked at `row_index`, via
+/// `row_ids`/`rows` -- `None` if the table was refreshed between the click
+/// landing and this lookup (the row the operator saw may no longer be at
+/// that index), which callers treat as "click did nothing" rather than
+/// guessing at a different row.
+fn record_at_row<'a>(row_ids: &RefCell<Vec<WirePairId>>, rows: &'a HashMap<WirePairId, WireOpportunityRecord>, row_index: usize) -> Option<&'a WireOpportunityRecord> {
+    let pair_id = *row_ids.borrow().get(row_index)?;
+    rows.get(&pair_id)
+}
+
+/// The operator-editable numeric inputs `submit_box_to_rmtrade` reads --
+/// bundled by reference rather than passed as nine positional
+/// `&nwg::TextInput` arguments, which would be an easy way to silently pass
+/// two of them in the wrong order at the call site.
+struct RmtradeInputs<'a> {
+    qty: &'a nwg::TextInput,
+    max_buy_lot: &'a nwg::TextInput,
+    max_sell_lot: &'a nwg::TextInput,
+    n_lot: &'a nwg::TextInput,
+    profit: &'a nwg::TextInput,
+    jump: &'a nwg::TextInput,
+    bid_time: &'a nwg::TextInput,
+    delta: &'a nwg::TextInput,
+    lot_threshold: &'a nwg::TextInput,
+}
+
+/// Resolves `record`'s four leg tokens and immediately sends the
+/// `add_box_spread` request -- fires when the row's "RMTrade" cell is
+/// clicked, no separate confirm step. The exact data being sent is logged
+/// to `order_log` right before the send attempt (see `OrderLog::log_send`'s
+/// doc for why it's scoped to only the request payload, not the table row
+/// or the response). Reports the outcome via a modal after the fact;
+/// `parent` anchors it to the main window.
+fn submit_box_to_rmtrade(parent: &nwg::Window, token_index: &TokenIndex, record: &WireOpportunityRecord, order_log: &RefCell<OrderLog>, inputs: &RmtradeInputs) {
+    let pair_id = record.pair_id;
+    let Some(legs) = rmtrade_gateway::resolve_legs(token_index, pair_id.expiry_id, pair_id.k1, pair_id.k2) else {
+        nwg::modal_error_message(
+            parent.handle,
+            "Unknown contract",
+            &format!("Couldn't find all four leg tokens for K1={} K2={} in the loaded contract file -- it may be stale.", pair_id.k1, pair_id.k2),
+        );
+        return;
+    };
+
+    let parse_positive = |input: &nwg::TextInput, field: &str| -> Option<f64> {
+        match input.text().trim().parse::<f64>() {
+            Ok(v) if v > 0.0 => Some(v),
+            _ => {
+                nwg::modal_error_message(parent.handle, "Invalid value", &format!("{field} must be a positive number."));
+                None
+            }
+        }
+    };
+    // Profit/Jump/Delta may legitimately be 0 (their documented default) or
+    // negative (e.g. Jump as a signed threshold) -- only Qty/lot limits are
+    // required strictly positive.
+    let parse_number = |input: &nwg::TextInput, field: &str| -> Option<f64> {
+        match input.text().trim().parse::<f64>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                nwg::modal_error_message(parent.handle, "Invalid value", &format!("{field} must be a number."));
+                None
+            }
+        }
+    };
+    let parse_nonneg_int = |input: &nwg::TextInput, field: &str| -> Option<i64> {
+        match input.text().trim().parse::<i64>() {
+            Ok(v) if v >= 0 => Some(v),
+            _ => {
+                nwg::modal_error_message(parent.handle, "Invalid value", &format!("{field} must be a non-negative whole number."));
+                None
+            }
+        }
+    };
+    let Some(qty) = parse_positive(inputs.qty, "Quantity") else { return };
+    let Some(max_buy_lot) = parse_positive(inputs.max_buy_lot, "Max Buy Lot") else { return };
+    let Some(max_sell_lot) = parse_positive(inputs.max_sell_lot, "Max Sell Lot") else { return };
+    let Some(n_lot) = parse_positive(inputs.n_lot, "N Lot") else { return };
+    let Some(profit) = parse_number(inputs.profit, "Profit") else { return };
+    let Some(jump) = parse_number(inputs.jump, "Jump") else { return };
+    let Some(delta) = parse_number(inputs.delta, "Delta") else { return };
+    let Some(bid_time) = parse_nonneg_int(inputs.bid_time, "eBidTime") else { return };
+    let Some(lot_threshold) = parse_nonneg_int(inputs.lot_threshold, "Lot Threshold") else { return };
+
+    let params = BoxSpreadParams { qty, max_buy_lot, max_sell_lot, n_lot, profit, jump, bid_time, delta, lot_threshold };
+    let client_ref = format!("box_scanner-{}-{}-{}", pair_id.expiry_id, pair_id.k1, pair_id.k2);
+
+    // Logged here, before the send attempt -- this is a record of what we
+    // sent, so it shouldn't depend on whether RMTrade answers.
+    if let Err(e) = order_log.borrow_mut().log_send(&legs, &client_ref, &params) {
+        eprintln!("warning: failed to write RMTrade order log line: {e}");
+    }
+
+    match rmtrade_gateway::send_add_box_spread(&legs, client_ref, params) {
+        Ok(resp) if resp.ok => {
+            nwg::modal_info_message(parent.handle, "Sent to RMTrade", &format!("Strategy added -- strgy_id {}", resp.strgy_id.map(|id| id.to_string()).unwrap_or_else(|| "?".to_string())));
+        }
+        Ok(resp) => {
+            nwg::modal_error_message(
+                parent.handle,
+                "RMTrade rejected the request",
+                &format!("error_code {}: {}", resp.error_code.unwrap_or_default(), resp.error.unwrap_or_default()),
+            );
+        }
+        Err(e) => {
+            nwg::modal_error_message(parent.handle, "Send to RMTrade failed", &e.to_string());
+        }
     }
 }
 
@@ -209,21 +340,22 @@ const RATE_FILTER_Y: i32 = 170;
 const MIN_TABLE_W: i32 = 200;
 const MIN_TABLE_H: i32 = 150;
 
-/// Resizes/repositions the two tables, their headings, and the
-/// short-side rate filter (Cash Gen. Max Rate %, whose left edge tracks
-/// the short table's) to fill whatever the window's current client area
-/// is -- the only part of the layout that reflows on resize. The
-/// long-side rate filter and the rest of the filter controls above stay
-/// put; their fixed positions/sizes never having needed to change, since
-/// the long table's left edge is a fixed margin, not resize-dependent.
+/// Resizes/repositions the two tables, their headings, the short-side
+/// rate filter (Cash Gen. Max Rate %), and its Start/Stop toggle -- all of
+/// which have their left edge tracking the short table's -- to fill
+/// whatever the window's current client area is. The long-side rate
+/// filter and the rest of the filter controls above stay put; their fixed
+/// positions/sizes never having needed to change, since the long table's
+/// left edge is a fixed margin, not resize-dependent.
 #[allow(clippy::too_many_arguments)]
-fn layout_tables(window_w: i32, window_h: i32, long_heading: &nwg::Label, short_heading: &nwg::Label, long_list: &nwg::ListView, short_list: &nwg::ListView, maxrate_label: &nwg::Label, maxrate_input: &nwg::TextInput) {
+fn layout_tables(window_w: i32, window_h: i32, long_heading: &nwg::Label, short_heading: &nwg::Label, long_list: &nwg::ListView, short_list: &nwg::ListView, maxrate_label: &nwg::Label, maxrate_input: &nwg::TextInput, cashgen_toggle: &nwg::Button) {
     let table_w = ((window_w - TABLE_MARGIN * 2 - TABLE_GAP) / 2).max(MIN_TABLE_W);
     let table_h = (window_h - TABLE_Y - TABLE_MARGIN).max(MIN_TABLE_H);
     let right_x = TABLE_MARGIN + table_w + TABLE_GAP;
 
     maxrate_label.set_position(right_x, RATE_FILTER_Y);
     maxrate_input.set_position(right_x + 160, RATE_FILTER_Y - 2);
+    cashgen_toggle.set_position(right_x + 230, RATE_FILTER_Y - 2);
 
     long_heading.set_size(table_w as u32, 20);
     short_heading.set_position(right_x, HEADING_Y);
@@ -240,7 +372,7 @@ fn layout_tables(window_w: i32, window_h: i32, long_heading: &nwg::Label, short_
 /// and `strikes_by_expiry` (epoch -> sorted strikes with both a CE and PE)
 /// are the full, unrestricted catalog computed once at startup -- the
 /// pickers here never need to touch the contract file themselves.
-pub fn run(state: SharedGuiState, filter_request: SharedFilterRequest, expiries: Vec<(i64, String)>, strikes_by_expiry: HashMap<i64, Vec<i64>>) -> Result<(), nwg::NwgError> {
+pub fn run(state: SharedGuiState, filter_request: SharedFilterRequest, expiries: Vec<(i64, String)>, strikes_by_expiry: HashMap<i64, Vec<i64>>, token_index: TokenIndex, order_log: OrderLog) -> Result<(), nwg::NwgError> {
     nwg::init()?;
     let _ = nwg::Font::set_global_family("Segoe UI");
 
@@ -297,6 +429,57 @@ pub fn run(state: SharedGuiState, filter_request: SharedFilterRequest, expiries:
     let mut apply_button = Default::default();
     nwg::Button::builder().text("Apply Filter").position((620, 88)).size((120, 26)).parent(&window).build(&mut apply_button)?;
 
+    // Strategy execution parameters for the per-row RMTrade send
+    // (`Third_party_gateway.md` §3's `max_buy_lot`/`max_sell_lot`/`n_lot`/
+    // `profit`/`jump`/`bid_time`/`delta`/`lot_threshold`) -- unlike Lot
+    // Size/Quantity above (display-only scaling of already-computed rows),
+    // these become real parameters on a live RMTrade strategy the moment a
+    // row's "RMTrade" cell is clicked, so they get their own visible,
+    // always-editable inputs rather than a silent default. Shared by every
+    // row in both tables -- there's one set of values, not one per row.
+    // Two rows x four columns, matching RMTrade's own Add dialog's field
+    // grouping (Profit/Jump/eBidTime/Delta on top, the three lot limits
+    // plus Lot Threshold below).
+    let mut profit_label = Default::default();
+    nwg::Label::builder().text("Profit").position((760, 80)).size((55, 22)).parent(&window).build(&mut profit_label)?;
+    let mut profit_input = Default::default();
+    nwg::TextInput::builder().text("0").position((820, 78)).size((70, 22)).parent(&window).build(&mut profit_input)?;
+
+    let mut jump_label = Default::default();
+    nwg::Label::builder().text("Jump").position((900, 80)).size((50, 22)).parent(&window).build(&mut jump_label)?;
+    let mut jump_input = Default::default();
+    nwg::TextInput::builder().text("0").position((955, 78)).size((70, 22)).parent(&window).build(&mut jump_input)?;
+
+    let mut bidtime_label = Default::default();
+    nwg::Label::builder().text("eBidTime").position((1035, 80)).size((70, 22)).parent(&window).build(&mut bidtime_label)?;
+    let mut bidtime_input = Default::default();
+    nwg::TextInput::builder().text("0").position((1110, 78)).size((70, 22)).parent(&window).build(&mut bidtime_input)?;
+
+    let mut delta_label = Default::default();
+    nwg::Label::builder().text("Delta").position((1190, 80)).size((50, 22)).parent(&window).build(&mut delta_label)?;
+    let mut delta_input = Default::default();
+    nwg::TextInput::builder().text("0").position((1245, 78)).size((70, 22)).parent(&window).build(&mut delta_input)?;
+
+    let mut maxbuylot_label = Default::default();
+    nwg::Label::builder().text("Max Buy Lot").position((760, 105)).size((80, 22)).parent(&window).build(&mut maxbuylot_label)?;
+    let mut maxbuylot_input = Default::default();
+    nwg::TextInput::builder().text("5").position((845, 103)).size((55, 22)).parent(&window).build(&mut maxbuylot_input)?;
+
+    let mut maxselllot_label = Default::default();
+    nwg::Label::builder().text("Max Sell Lot").position((910, 105)).size((80, 22)).parent(&window).build(&mut maxselllot_label)?;
+    let mut maxselllot_input = Default::default();
+    nwg::TextInput::builder().text("5").position((995, 103)).size((55, 22)).parent(&window).build(&mut maxselllot_input)?;
+
+    let mut nlot_label = Default::default();
+    nwg::Label::builder().text("N Lot").position((1060, 105)).size((45, 22)).parent(&window).build(&mut nlot_label)?;
+    let mut nlot_input = Default::default();
+    nwg::TextInput::builder().text("5").position((1110, 103)).size((55, 22)).parent(&window).build(&mut nlot_input)?;
+
+    let mut lotthreshold_label = Default::default();
+    nwg::Label::builder().text("Lot Threshold").position((1175, 105)).size((95, 22)).parent(&window).build(&mut lotthreshold_label)?;
+    let mut lotthreshold_input = Default::default();
+    nwg::TextInput::builder().text("0").position((1275, 103)).size((55, 22)).parent(&window).build(&mut lotthreshold_input)?;
+
     // Each rate filter sits directly above its own table, not crammed into
     // the shared control row above -- display-only, filtering which
     // already-computed rows are shown (by Ann. rate), read live every
@@ -320,6 +503,14 @@ pub fn run(state: SharedGuiState, filter_request: SharedFilterRequest, expiries:
     let mut maxrate_input = Default::default();
     nwg::TextInput::builder().position((1110, 168)).size((60, 22)).parent(&window).build(&mut maxrate_input)?;
 
+    // Display-only pause/resume for the short (cash generation) table --
+    // the pricing engine keeps computing both directions together
+    // underneath regardless (long and short are always priced in the same
+    // pass), this just freezes/resumes what OnTimerTick writes into
+    // short_list. The long table is unaffected either way.
+    let mut cashgen_toggle = Default::default();
+    nwg::Button::builder().text("Stop Cash Gen.").position((1180, 168)).size((110, 26)).parent(&window).build(&mut cashgen_toggle)?;
+
     let mut long_heading = Default::default();
     nwg::Label::builder().text("Long box \u{2014} cash deployment").position((10, 195)).size((930, 20)).parent(&window).build(&mut long_heading)?;
 
@@ -340,6 +531,17 @@ pub fn run(state: SharedGuiState, filter_request: SharedFilterRequest, expiries:
     // read back when Apply Filter maps selected indices to real strikes.
     let current_strikes: RefCell<Vec<i64>> = RefCell::new(Vec::new());
 
+    // Index-aligned with long_list/short_list's current rows -- see
+    // refresh_list's doc. Backs the "Send to RMTrade" button's selection lookup.
+    let long_row_ids: RefCell<Vec<WirePairId>> = RefCell::new(Vec::new());
+    let short_row_ids: RefCell<Vec<WirePairId>> = RefCell::new(Vec::new());
+
+    // The event handler closure below must be `Fn` (native-windows-gui
+    // stores it as `Box<dyn Fn(...)>`), so `order_log` -- mutated on every
+    // send -- needs interior mutability like every other per-click state
+    // here (current_strikes, active_lot_multiplier, ...).
+    let order_log: RefCell<OrderLog> = RefCell::new(order_log);
+
     // Lot Size/Quantity/Min Rate/Max Rate used to be read straight off
     // their TextInputs on every 300ms refresh tick -- meaning the table
     // refiltered mid-keystroke, before the operator had finished typing a
@@ -351,10 +553,15 @@ pub fn run(state: SharedGuiState, filter_request: SharedFilterRequest, expiries:
     let active_min_rate: Cell<Option<f64>> = Cell::new(None);
     let active_max_rate: Cell<Option<f64>> = Cell::new(None);
 
+    // Cash generation's display starts running -- the toggle button pauses
+    // it, it doesn't gate an initial start (matches every other control
+    // here defaulting to "on" until the operator changes something).
+    let cash_gen_running: Cell<bool> = Cell::new(true);
+
     let window = Rc::new(window);
     let events_window = window.clone();
 
-    let handler = nwg::full_bind_event_handler(&window.handle, move |evt, _evt_data, handle| {
+    let handler = nwg::full_bind_event_handler(&window.handle, move |evt, evt_data, handle| {
         use nwg::Event as E;
         match evt {
             E::OnWindowClose if &handle == &events_window as &nwg::Window => {
@@ -369,7 +576,12 @@ pub fn run(state: SharedGuiState, filter_request: SharedFilterRequest, expiries:
             // -- both have to be handled the same way here.
             E::OnResize | E::OnWindowMaximize if &handle == &events_window as &nwg::Window => {
                 let (w, h) = events_window.size();
-                layout_tables(w as i32, h as i32, &long_heading, &short_heading, &long_list, &short_list, &maxrate_label, &maxrate_input);
+                layout_tables(w as i32, h as i32, &long_heading, &short_heading, &long_list, &short_list, &maxrate_label, &maxrate_input, &cashgen_toggle);
+            }
+            E::OnButtonClick if handle == cashgen_toggle => {
+                let running = !cash_gen_running.get();
+                cash_gen_running.set(running);
+                cashgen_toggle.set_text(if running { "Stop Cash Gen." } else { "Start Cash Gen." });
             }
             E::OnButtonClick if handle == load_expiries_button => {
                 // Index 0 is always "All Expiries" (FilterSpec::expiry_epoch
@@ -481,13 +693,15 @@ pub fn run(state: SharedGuiState, filter_request: SharedFilterRequest, expiries:
                     }
                 }
 
+                let running = cash_gen_running.get();
                 status_label.set_text(&format!(
-                    "Benchmark: {:.2}%   |   {} packets, {} messages   |   {} long, {} short opportunities   |   ATM: {}   |   active: {} ({} pair(s))",
+                    "Benchmark: {:.2}%   |   {} packets, {} messages   |   {} long, {} short opportunities{}   |   ATM: {}   |   active: {} ({} pair(s))",
                     s.benchmark_rate,
                     s.packet_count,
                     s.message_count,
                     s.long.len(),
                     s.short.len(),
+                    if running { "" } else { " (cash gen. paused)" },
                     s.current_atm.map(|a| format!("{a:.0}")).unwrap_or_else(|| "waiting for future tick...".to_string()),
                     if s.active_expiry.is_empty() { "none applied yet" } else { &s.active_expiry },
                     s.pair_count
@@ -495,8 +709,63 @@ pub fn run(state: SharedGuiState, filter_request: SharedFilterRequest, expiries:
                 // Long/deployment uses only the floor (min_rate); short/generation
                 // uses only the ceiling (max_rate) -- see the controls' doc comment
                 // for why the two tables filter in opposite directions.
-                refresh_list(&long_list, &s.long, lot_multiplier, min_rate, None);
-                refresh_list(&short_list, &s.short, lot_multiplier, None, max_rate);
+                refresh_list(&long_list, &long_row_ids, &s.long, lot_multiplier, min_rate, None);
+                // Cash gen.'s Start/Stop toggle: while stopped, short_list
+                // just isn't touched this tick -- it stays exactly as it
+                // last was, the underlying pricing keeps running regardless.
+                if running {
+                    refresh_list(&short_list, &short_row_ids, &s.short, lot_multiplier, None, max_rate);
+                }
+            }
+            // A click anywhere in the ListView fires this; only one landing
+            // in the "RMTrade" column (index 0, see RMTRADE_COLUMN_INDEX),
+            // on an actual row, submits that row -- clicking elsewhere
+            // (selecting, clicking a price cell) does nothing here.
+            E::OnListViewClick if handle == long_list => {
+                let (row_index, column_index) = evt_data.on_list_view_item_index();
+                if row_index == usize::MAX || column_index != RMTRADE_COLUMN_INDEX {
+                    return;
+                }
+                let s = state.lock().unwrap();
+                let record = record_at_row(&long_row_ids, &s.long, row_index).cloned();
+                drop(s);
+                if let Some(record) = record {
+                    let rmtrade_inputs = RmtradeInputs {
+                        qty: &qty_input,
+                        max_buy_lot: &maxbuylot_input,
+                        max_sell_lot: &maxselllot_input,
+                        n_lot: &nlot_input,
+                        profit: &profit_input,
+                        jump: &jump_input,
+                        bid_time: &bidtime_input,
+                        delta: &delta_input,
+                        lot_threshold: &lotthreshold_input,
+                    };
+                    submit_box_to_rmtrade(&events_window, &token_index, &record, &order_log, &rmtrade_inputs);
+                }
+            }
+            E::OnListViewClick if handle == short_list => {
+                let (row_index, column_index) = evt_data.on_list_view_item_index();
+                if row_index == usize::MAX || column_index != RMTRADE_COLUMN_INDEX {
+                    return;
+                }
+                let s = state.lock().unwrap();
+                let record = record_at_row(&short_row_ids, &s.short, row_index).cloned();
+                drop(s);
+                if let Some(record) = record {
+                    let rmtrade_inputs = RmtradeInputs {
+                        qty: &qty_input,
+                        max_buy_lot: &maxbuylot_input,
+                        max_sell_lot: &maxselllot_input,
+                        n_lot: &nlot_input,
+                        profit: &profit_input,
+                        jump: &jump_input,
+                        bid_time: &bidtime_input,
+                        delta: &delta_input,
+                        lot_threshold: &lotthreshold_input,
+                    };
+                    submit_box_to_rmtrade(&events_window, &token_index, &record, &order_log, &rmtrade_inputs);
+                }
             }
             _ => {}
         }

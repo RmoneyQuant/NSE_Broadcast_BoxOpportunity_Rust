@@ -1,0 +1,8 @@
+timestamp,action,client_ref,exchange,k1_ce_token,k2_ce_token,k1_pe_token,k2_pe_token,qty,max_buy_lot,max_sell_lot,n_lot,pro,client_code,sell_spread,buy_spread,profit,jump,bid_time,delta,lot_threshold
+2026-08-25 13:30:02.985,add_box_spread,box_scanner-1475159400-25000-25300,EXCHG_NSE_FO,74365,74386,71765,71771,1,1,1,1,true,,1,-1,1,0,1,1,1
+2026-08-25 13:30:31.682,add_box_spread,box_scanner-1475159400-24500-25300,EXCHG_NSE_FO,71742,74386,74242,71771,1,1,1,1,true,,1,-1,1,0,1,1,1
+2026-08-25 13:30:42.220,add_box_spread,box_scanner-1472740200-24300-25100,EXCHG_NSE_FO,46997,47029,46998,47030,1,1,1,1,true,,1,-1,1,0,1,1,1
+2026-08-25 13:32:56.815,add_box_spread,box_scanner-1472740200-24400-24450,EXCHG_NSE_FO,47001,47003,47002,47004,1,1,1,1,true,,1,-1,1,0,1,1,1
+2026-08-25 13:34:13.971,add_box_spread,box_scanner-1472740200-24200-25000,EXCHG_NSE_FO,46993,47025,46994,47026,1,1,1,1,true,,1,-1,1,0,1,1,1
+2026-08-25 13:41:06.681,add_box_spread,box_scanner-1475159400-24000-24050,EXCHG_NSE_FO,65900,74060,71733,74063,1,1,1,1,true,,1,-1,1,0,1,1,1
+2026-08-25 14:52:21.166,add_box_spread,box_scanner-1477578600-24000-24100,EXCHG_NSE_FO,50280,50283,51393,51399,1,1,1,1,true,,1,-1,1,0,1,1,1
